@@ -141,7 +141,7 @@ uniform sampler2D u_tex;
 uniform float u_alpha;
 out vec4 f_color;
 void main() {
-    vec4 t = texture(u_tex, vec2(v_uv.x, 1.0 - v_uv.y));
+    vec4 t = texture(u_tex, vec2(1.0 - v_uv.y, v_uv.x));
     float a = t.a * u_alpha;
     if (a < 0.02) discard;
     f_color = vec4(t.rgb * a, a);
@@ -215,16 +215,21 @@ def quad_arrays():
     return v.ravel(), idx
 
 
-def flat_ring_arrays(rim, rom, segs=128):
-    """A flat ring in the XZ plane (radius rim -> rom)."""
+def flat_ring_arrays(rim, rom, segs=160):
+    """A flat ring in the XZ plane (radius rim -> rom).
+
+    uv: x = azimuth around the ring, y = radius (0 outer, 1 inner); the
+    shader samples the strip texture as vec2(1.0 - v_uv.y, v_uv.x) because
+    the strip's WIDTH is the radial profile (inner on the left) and its
+    HEIGHT is the azimuth (all rows are identical)."""
     positions, uvs, indices = [], [], []
     for i in range(segs + 1):
         a = math.radians(360.0 * i / segs)
         ca, sa = math.cos(a), math.sin(a)
         positions.append((rom * ca, 0.0, rom * sa))
         positions.append((rim * ca, 0.0, rim * sa))
-        uvs.append((0.0, i / segs))
-        uvs.append((1.0, i / segs))
+        uvs.append((i / segs, 0.0))
+        uvs.append((i / segs, 1.0))
     for i in range(segs):
         j = i * 2
         indices += [j, j + 1, j + 2, j + 1, j + 3, j + 2]
@@ -381,7 +386,7 @@ class Camera:
         return perspective(FOVY, self.aspect, NEAR, FAR)
 
     def orbit(self, dx, dy):
-        self.yaw -= dx * 0.006
+        self.yaw += dx * 0.006
         self.pitch = max(-1.45, min(1.45, self.pitch + dy * 0.006))
 
     def pan(self, dx, dy, vh):
@@ -435,7 +440,7 @@ class Camera:
 # ---------------------------------------------------------------------------
 
 class Scene:
-    def __init__(self, ctx, vw, vh):
+    def __init__(self, ctx, vw, vh, ring_radii=(1.45, 2.6)):
         self.ctx = ctx
         self.vw, self.vh = vw, vh
         self.textures = {}
@@ -462,9 +467,11 @@ class Scene:
         self.halo_vao = ctx.vertex_array(
             self.prog_halo, [(ctx.buffer(q), "3f 2f",
                               "in_position", "in_uv")], ctx.buffer(qi))
+        rim, rom = ring_radii
+        rq, rqi = flat_ring_arrays(rim, rom)
         self.ring_vao = ctx.vertex_array(
-            self.prog_ring, [(ctx.buffer(q), "3f 2f",
-                              "in_position", "in_uv")], ctx.buffer(qi))
+            self.prog_ring, [(ctx.buffer(rq), "3f 2f",
+                              "in_position", "in_uv")], ctx.buffer(rqi))
 
                 # Buffers are pre-allocated at their full size so the VAOs keep the
         # right vertex count (moderngl caches it at creation; orphaning a

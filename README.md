@@ -83,7 +83,7 @@ button again to return to the 3D view.
 | --------------------- | ------------------------------------------------- |
 | Drag on the 3D view   | orbit the camera around the system                |
 | Right / middle drag   | slide the view (pan)                              |
-| Mouse wheel           | zoom in / out (towards your pointer, or the pinned world) |
+| Mouse wheel           | zoom in (up) / out (down), towards your pointer or the pinned world |
 | Click a world         | pin it — the camera follows it; click empty space to unpin |
 | `PLAY` / `Space`      | play / pause the sim clock                        |
 | `rewind` / `forward`  | jump one day back / forward                       |
@@ -119,6 +119,23 @@ Silently reproducible, so you can batch screenshots headlessly:
 python solar_system.py --shot shots_3d/scene_default.png    # 3D view
 python solar_system.py --lightmap shots_3d/daylight_map.png  # 2D map view
 ```
+
+Composite captures go through `snap_display()`, which re-rotates the display
+read-back 180° (sideways + upside) so the saved PNGs are upright — the
+`shots_3d/` images were generated this way.
+
+## Tests
+
+A `unittest` suite lives in `tests/` — pure math/geometry checks plus a
+headless engine smoke test (it renders real frames off-screen and regression-
+tests the Saturn ring, snapshot orientation, orbit drag and wheel directions).
+
+```
+python -m unittest discover -s tests -v
+```
+
+The engine tests use the SDL *dummy* video driver and need an OpenGL 3.3
+context; on machines without a GPU they are skipped automatically.
 
 ## Files
 

@@ -615,7 +615,8 @@ class SolarSystemApp:
         self.cam = Camera(self.W / max(1, self.CANVAS_H),
                           dist_min=DIST_MIN, dist_max=DIST_MAX,
                           start_dist=DIST_HOME)
-        self.scene = Scene(self.ctx, self.W, self.CANVAS_H)
+        self.scene = Scene(self.ctx, self.W, self.CANVAS_H,
+                           ring_radii=SATURN_RING)
         self.scene.upload_textures(self._load_texture_surfaces())
 
         self.label_cache = {}
@@ -1660,7 +1661,7 @@ class SolarSystemApp:
                 elif event.type == pygame.MOUSEWHEEL:
                     mpos = pygame.mouse.get_pos()
                     if mpos[1] < self.CANVAS_H and self.view_mode == "3d":
-                        factor = 1.15 ** event.y
+                        factor = 1.15 ** -event.y
                         self.cam.zoom_to(
                             mpos[0], mpos[1], factor, self.W, self.CANVAS_H,
                             move_target=(self.pinned is None))
@@ -1792,11 +1793,13 @@ class SolarSystemApp:
 
 def snap_display(buf):
     """Copy the display surface (after a flip) to a plain surface whose raw
-    pixels are reliable to export."""
+    pixels are reliable to export.  The display read-back comes back rotated
+    180 degrees, so the copy is flipped both ways (sideways + upside) again
+    to land upright in the saved image."""
     pygame.display.flip()
     out = pygame.Surface(buf.get_size())
     out.blit(buf, (0, 0))
-    return out
+    return pygame.transform.flip(out, True, True)
 
 
 def save_png(surface, path):
