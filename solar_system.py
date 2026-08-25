@@ -32,7 +32,9 @@ if LIB_DIR not in sys.path:
 sys.path.insert(0, os.path.join(LIB_DIR, "vendor"))
 
 import solarsystem
-from scene3d import (Camera, Scene, render, to_surface, FOVY)
+from solarsystem.functions import precession_longitude_correction
+from scene3d import (Camera, Scene, render, to_surface, FOVY,
+                     ORBIT_SEGS, MOON_SEGS)
 
 # ----------------------------------------------------------------------------
 # Defaults (windowed; everything adapts to the current window size)
@@ -44,6 +46,7 @@ FPS = 60
 MARGIN = 70
 AU_KM = 149597870.7
 EARTH_RADIUS_PER_AU = 23455.0
+_UNIX_EPOCH = datetime.datetime(1970, 1, 1)
 
 ORB_MOON = 2.6
 SUN_R = 3.4
@@ -226,8 +229,9 @@ def lerp_color(a, b, t):
     return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
-def signpower(num, power):
-    return math.copysign(abs(num) ** power, num) if num != 0 else 0.0
+def utc_now():
+    """Naive datetime holding the current UTC wall-clock time."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
 
 def julian_day(t):
@@ -244,6 +248,34 @@ def julian_day(t):
 def gmst_deg(t):
     jd = julian_day(t)
     return (280.46061837 + 360.98564736629 * (jd - 2451545.0)) % 360.0
+
+
+def sun_ra_decl(t):
+    """Apparent geocentric RA / declination of the Sun, in degrees.
+
+    Low-precision solar theory (Paul Schlyter's formulas, the same model the
+    vendored library uses), accurate to ~0.01 deg - far better than needed
+    for terminator placement.  The precession correction matches the one the
+    vendored library applies to its own longitudes, keeping every part of
+    the app in the same equinox-of-date frame.  Because the RA is the
+    *apparent* sun, the equation of time is included automatically."""
+    d = julian_day(t) - 2451543.5
+    w = 282.9404 + 4.70935e-5 * d
+    e = 0.016709 - 1.151e-9 * d
+    M = math.radians((356.047 + 0.9856002585 * d) % 360.0)
+    E = M + e * math.sin(M) * (1.0 + e * math.cos(M))
+    x = math.cos(E) - e
+    y = math.sin(E) * math.sqrt(1.0 - e * e)
+    v = math.atan2(y, x)
+    lam = v + math.radians(w)
+    lam -= math.radians(precession_longitude_correction(julian_day(t)))
+    oblecl = math.radians(23.4393 - 3.563e-7 * d)
+    xe = math.cos(lam)
+    ye = math.cos(oblecl) * math.sin(lam)
+    ze = math.sin(oblecl) * math.sin(lam)
+    ra = math.degrees(math.atan2(ye, xe)) % 360.0
+    decl = math.degrees(math.asin(max(-1.0, min(1.0, ze))))
+    return ra, decl
 
 
 def orbit_radius(sma):
@@ -569,9 +601,7 @@ class SolarSystemApp:
         self.font_big = self.get_font(28)
         self.font_tooltip = self.get_font(14)
 
-        self.sim_time = datetime.datetime.now(
-            datetime.timezone.utc).replace(tzinfo=None)
-        self.start_time = self.sim_time
+        self.sim_time = utc_now()
         self.paused = True
         self.speed_index = 2
         self.realtime = False
@@ -582,6 +612,25 @@ class SolarSystemApp:
         self.show_daynight = True
         self.fullscreen = False
         self.view_mode = "3d"
+
+        # Ephemeris cache: recomputed only when the clock or the body set
+        # changes (previously a full heliocentric solve ran every frame,
+        # even while paused).
+        self._astro_key = None
+        self._bodyset_key = None
+        self.planets_au = {}
+        self.positions = {}
+        self.body_r = {}
+        self.moon_r_au = 0.0
+        self.world = {}
+        self.earth_rot = 0.0
+
+        # Frame cache: the GL scene is re-rendered only when something can
+        # change it (camera moved, clock running, toggle flipped); while
+        # paused and untouched the last rendered surface is re-blitted.
+        self._scene_dirty = True
+        self._frame_surf = None
+        self._pick_bodies = None
 
         self._dl_base = None
         self._dl_key = None
@@ -615,6 +664,7 @@ class SolarSystemApp:
         self.cam = Camera(self.W / max(1, self.CANVAS_H),
                           dist_min=DIST_MIN, dist_max=DIST_MAX,
                           start_dist=DIST_HOME)
+        self._homog = np.zeros(4, dtype=np.float32)
         self.scene = Scene(self.ctx, self.W, self.CANVAS_H,
                            ring_radii=SATURN_RING)
         self.scene.upload_textures(self._load_texture_surfaces())
@@ -751,12 +801,13 @@ class SolarSystemApp:
         self.VIEW_W = self.W - self.PANEL_W
 
     def _taskbar_right_width(self):
-        date = self.font_section.size("Wednesday, 12 December 2026")[0]
+        date = self.font_section.size(
+            self.sim_time.strftime("%A, %d %B %Y"))[0]
         speed = self.font_small.size(
             "SPEED " + SPEED_LABEL[SPEED_DAYS[self.speed_index]])[0]
         rt = self.font_small.size("REALTIME 1x")[0]
         zoom = self.font_small.size("ZOOM 4000%")[0]
-        return date + max(speed, rt) + zoom + 90
+        return date + max(speed, rt) + zoom + 70
 
     def build_buttons(self):
         defs = [
@@ -778,10 +829,16 @@ class SolarSystemApp:
         ]
         n = len(defs)
         right = self._taskbar_right_width()
-        avail = max(60, self.W - right - 30)
-        btn = int(min(BTN_W, max(28, (avail - BTN_GAP * (n - 1)) // n)))
+        avail = max(40, self.W - right - 30)
+        btn = (avail - BTN_GAP * (n - 1)) // n
+        gap = BTN_GAP
+        if btn < 24:
+            # Narrow windows: tighten the gaps first, then the buttons.
+            gap = max(2, min(BTN_GAP, (avail - n * 24) // max(1, n - 1)))
+            btn = max(16, (avail - gap * (n - 1)) // n)
+        btn = int(min(BTN_W, btn))
         self.btn_size = btn
-        self.btn_icon = max(14, btn - 14)
+        self.btn_icon = max(10, btn - 12)
 
         icons = {
             "play": self.make_icon(_icon_play, self.btn_icon),
@@ -811,7 +868,7 @@ class SolarSystemApp:
                 "id": bid, "icon": icon, "tip": tip,
                 "rect": pygame.Rect(x, y, btn, btn),
             })
-            x += btn + BTN_GAP
+            x += btn + gap
         return btns
 
     def _rebuild_for_size(self, center):
@@ -828,6 +885,7 @@ class SolarSystemApp:
         self.fact_cache.clear()
         if center:
             self.cam.reset(DIST_HOME)
+        self._scene_dirty = True
 
     def _handle_resize(self, w, h):
         w = max(480, int(w))
@@ -849,12 +907,10 @@ class SolarSystemApp:
         self.W, self.H = self.screen.get_size()
         self._rebuild_for_size(center=True)
 
-    def reset_view(self, home=False):
+    def reset_view(self):
         self.pinned = None
-        if home:
-            self.cam.reset(DIST_HOME)
-        else:
-            self.cam.reset(DIST_HOME)
+        self.cam.reset(DIST_HOME)
+        self._scene_dirty = True
 
     # ---------------------------------------------------------- computation
     def visible_names(self):
@@ -864,7 +920,17 @@ class SolarSystemApp:
         return names
 
     def update_world(self, dt):
+        names = self.visible_names()
+        bodyset = tuple(names)
         t = self.sim_time
+        if t == self._astro_key and bodyset == self._bodyset_key:
+            # Clock and body set unchanged - keep the cached ephemeris.
+            if not self.paused:
+                self._update_spins(dt)
+            return
+
+        self._astro_key = t
+        self._bodyset_key = bodyset
         h = solarsystem.Heliocentric(
             year=t.year, month=t.month, day=t.day,
             hour=t.hour, minute=t.minute,
@@ -873,7 +939,6 @@ class SolarSystemApp:
 
         self.positions = {}
         self.body_r = {}
-        names = self.visible_names()
         for n in names:
             x, y, z = self.planets_au[n]
             self.positions[n] = (x, y, z)
@@ -889,6 +954,8 @@ class SolarSystemApp:
 
         self.world["Sun"] = np.zeros(3, dtype=np.float32)
 
+        earth_w = self.world["Earth"]
+
         moon = solarsystem.Moon(
             year=t.year, month=t.month, day=t.day,
             hour=t.hour, minute=t.minute,
@@ -896,12 +963,65 @@ class SolarSystemApp:
         mlon, mlat, mr = moon.position()
         self.moon_r_au = mr / EARTH_RADIUS_PER_AU
         mlon_r = math.radians(mlon)
-        earth_w = self.world["Earth"]
-        self.world["Moon"] = earth_w + ORB_MOON * np.array(
-            [math.cos(mlon_r), 0.0, math.sin(mlon_r)], dtype=np.float32)
-        self.scene.set_moon_ring(earth_w, ORB_MOON, MOON_ORBIT_COLOR)
+        mlat_r = math.radians(mlat)
+        # True geocentric direction in the ecliptic frame, mapped into the
+        # scene (ecliptic x,y,z -> scene x,z,y), so the Moon's 5.14-degree
+        # orbital inclination is preserved instead of being flattened.
+        moon_dir = np.array(
+            [math.cos(mlon_r) * math.cos(mlat_r), math.sin(mlat_r),
+             math.sin(mlon_r) * math.cos(mlat_r)], dtype=np.float64)
+        self.world["Moon"] = earth_w + ORB_MOON * moon_dir.astype(np.float32)
 
-        self._update_spins(dt)
+        # The Moon's orbital plane: fitted from three true geocentric
+        # directions sampled a quarter-month apart, so the ring carries the
+        # real inclination and the slowly regressing node line.
+        dirs = [moon_dir]
+        for k in (1, 2):
+            mt = t + datetime.timedelta(days=(27.321661 / 4.0) * k)
+            mm = solarsystem.Moon(
+                year=mt.year, month=mt.month, day=mt.day,
+                hour=mt.hour, minute=mt.minute,
+                UT=0, dst=0, longtitude=0.0, latitude=0.0, topographic=False)
+            lo, la, _ = mm.position()
+            lo, la = math.radians(lo), math.radians(la)
+            dirs.append(np.array(
+                [math.cos(lo) * math.cos(la), math.sin(la),
+                 math.sin(lo) * math.cos(la)], dtype=np.float64))
+        normal = (np.cross(dirs[0], dirs[1]) + np.cross(dirs[1], dirs[2]) +
+                  np.cross(dirs[2], dirs[0]))
+        norm = np.linalg.norm(normal)
+        if norm > 1e-9:
+            normal = normal / norm
+            u = dirs[0] / np.linalg.norm(dirs[0])
+            v = np.cross(normal, u)
+            offsets = []
+            for i in range(MOON_SEGS):
+                a = math.tau * i / MOON_SEGS
+                offsets.append(
+                    ORB_MOON * (math.cos(a) * u + math.sin(a) * v))
+            self.scene.set_moon_ring(earth_w, offsets, MOON_ORBIT_COLOR)
+
+        # Earth's spin phase: rotate the mesh so the texture longitude that
+        # faces the Sun is exactly the sub-solar longitude the 2D daylight
+        # map computes.  This replaces the old GMST shortcut and keeps the
+        # 3D terminator in sync with the map (equation of time included).
+        sh = -earth_w.astype(np.float64)
+        sh /= max(np.linalg.norm(sh), 1e-9)
+        eps = TILTS["Earth"]
+        ce, se = math.cos(eps), math.sin(eps)
+        ox = sh[0]
+        oz = -se * sh[1] + ce * sh[2]
+        rho = math.hypot(ox, oz)
+        if rho > 1e-9:
+            az_body = math.degrees(math.atan2(oz, ox))
+            lon_s, _ = self._dl_subsolar()
+            self.earth_rot = math.radians(
+                math.degrees(lon_s) + 180.0 - az_body)
+        else:
+            self.earth_rot = 0.0
+
+        if not self.paused:
+            self._update_spins(dt)
         self._update_rings(names)
 
     def _update_spins(self, dt):
@@ -919,7 +1039,7 @@ class SolarSystemApp:
     def build_bodies(self):
         names = self.visible_names()
         bodies = []
-        earth_rot = math.radians(gmst_deg(self.sim_time))
+        earth_rot = self.earth_rot
         for n in names:
             is_earth = n == "Earth"
             is_sun = n == "Sun"
@@ -965,8 +1085,9 @@ class SolarSystemApp:
 
     # ------------------------------------------------------------- projection
     def to_screen(self, p3):
-        p = np.append(np.array(p3, dtype=np.float32), 1.0)
-        clip = self._proj @ self._view @ p
+        h = self._homog
+        h[0], h[1], h[2], h[3] = p3[0], p3[1], p3[2], 1.0
+        clip = self._proj @ self._view @ h
         if clip[3] <= 1e-9:
             return None
         ndc = clip[:3] / clip[3]
@@ -976,8 +1097,9 @@ class SolarSystemApp:
         y = (0.5 - ndc[1] * 0.5) * self.CANVAS_H
         return x, y
 
-    def pick(self, px, py):
-        bodies = self.build_bodies()
+    def pick(self, px, py, bodies=None):
+        if bodies is None:
+            bodies = self.build_bodies()
         o, d = self.cam.ray(px, py, self.W, self.CANVAS_H)
         best_t, best = None, None
         for b in bodies:
@@ -1010,8 +1132,10 @@ class SolarSystemApp:
             self.paused = not self.paused
         elif bid == "rewind":
             self.sim_time -= datetime.timedelta(days=1)
+            self._scene_dirty = True
         elif bid == "forward":
             self.sim_time += datetime.timedelta(days=1)
+            self._scene_dirty = True
         elif bid == "slower":
             self.speed_index = max(0, self.speed_index - 1)
             self.realtime = False
@@ -1020,11 +1144,13 @@ class SolarSystemApp:
                                    self.speed_index + 1)
             self.realtime = False
         elif bid == "today":
-            self.sim_time = self.start_time
+            self.sim_time = utc_now()
+            self._scene_dirty = True
         elif bid == "realtime":
             self.realtime = not self.realtime
         elif bid == "worlds":
             self.show_extras = not self.show_extras
+            self._scene_dirty = True
         elif bid == "labels":
             self.show_labels = not self.show_labels
         elif bid == "distance":
@@ -1032,15 +1158,46 @@ class SolarSystemApp:
             self.show_about = False
         elif bid == "daynight":
             self.show_daynight = not self.show_daynight
+            self._scene_dirty = True
         elif bid == "lightmap":
-            self.view_mode = "daylight" if self.view_mode == "3d" else "3d"
+            self.toggle_view()
         elif bid == "about":
             self.show_about = not self.show_about
             self.show_distance = False
         elif bid == "fullscreen":
             self.toggle_fullscreen()
         elif bid == "fit":
-            self.reset_view(True)
+            self.reset_view()
+
+    def scrub(self, direction, dt):
+        """Nudge the clock while an arrow key is held (direction is +/-1).
+
+        In realtime mode this scrubs one hour of sim time per real second;
+        at preset speeds it runs twice the current days-per-second rate."""
+        if self.realtime:
+            self.sim_time += datetime.timedelta(hours=direction * dt)
+        else:
+            self.sim_time += datetime.timedelta(
+                days=direction * SPEED_DAYS[self.speed_index] * dt * 2)
+        self._scene_dirty = True
+
+    def toggle_view(self):
+        """Switch between the 3D scene and the 2D daylight map."""
+        if self.view_mode == "3d":
+            self.view_mode = "daylight"
+        else:
+            self.view_mode = "3d"
+            self._scene_dirty = True
+
+    def in_scene_view(self, pos):
+        """True when a window coordinate sits on the interactive 3D canvas.
+
+        Excludes the taskbar, the info-panel overlay on the right, and the
+        daylight-map view - clicks, drags, wheel and hover must never act on
+        worlds hidden underneath those."""
+        x, y = pos
+        return (self.view_mode == "3d" and 0 <= x < self.VIEW_W
+                and 0 <= y < self.CANVAS_H)
 
     def button_at(self, mx, my):
         for b in self.buttons:
@@ -1050,24 +1207,41 @@ class SolarSystemApp:
 
     # ------------------------------------------------------- daylight 2-D map
     def _dl_subsolar(self):
-        """Sub-solar point at self.sim_time: (lon, decl) in radians."""
-        st = self.sim_time
-        doy = st.timetuple().tm_yday
-        decl = math.radians(23.44 * math.sin(
-            math.tau * (doy - 81.0) / 365.25))
-        hfrac = st.hour + st.minute / 60.0 + st.second / 3600.0
-        lon = ((12.0 - hfrac) * 15.0 + 180.0) % 360.0 - 180.0
-        return math.radians(lon), decl
+        """Sub-solar point at self.sim_time: (lon, decl) in radians.
+
+        The longitude comes from the Sun's apparent right ascension versus
+        Greenwich mean sidereal time, so the equation of time is included
+        (the old mean-sun shortcut drifted up to ~4 degrees over the year);
+        the declination uses the true solar declination rather than a sine
+        of the day-of-year."""
+        ra, decl = sun_ra_decl(self.sim_time)
+        lon = (ra - gmst_deg(self.sim_time) + 180.0) % 360.0 - 180.0
+        return math.radians(lon), math.radians(decl)
 
     def _dl_base_maps(self):
         if self._dl_base is None:
             w, h = DL_MAP_W, DL_MAP_H
+
+            def load(fname, fallback):
+                path = os.path.join(TEX_DIR, fname)
+                if os.path.exists(path):
+                    try:
+                        return pygame.image.load(path).convert()
+                    except Exception:
+                        pass
+                return fallback
+
+            day_fb = procedural_texture("Earth")
+            night_fb = procedural_night()
+            cloud_fb = pygame.Surface((w, h))
+            cloud_fb.fill((150, 150, 150))
             base = {}
-            for key, fname in (("day", "2k_earth_daymap.jpg"),
-                               ("night", "2k_earth_nightmap.jpg"),
-                               ("cloud", "2k_earth_clouds.jpg")):
-                img = pygame.image.load(os.path.join(TEX_DIR, fname)).convert()
-                img = pygame.transform.smoothscale(img, (w, h))
+            for key, fname, fb in (
+                    ("day", "2k_earth_daymap.jpg", day_fb),
+                    ("night", "2k_earth_nightmap.jpg", night_fb),
+                    ("cloud", "2k_earth_clouds.jpg", cloud_fb)):
+                img = pygame.transform.smoothscale(
+                    load(fname, fb), (w, h))
                 arr = np.frombuffer(pygame.image.tostring(img, "RGB", False),
                                     dtype=np.uint8).reshape(h, w, 3)
                 base[key] = arr.astype(np.float32) / 255.0
@@ -1083,7 +1257,7 @@ class SolarSystemApp:
         """Build (or refresh) the 2-D equirectangular daylight map."""
         now = pygame.time.get_ticks()
         st = self.sim_time
-        key = (st.year, st.month, st.day, (st.hour * 60 + st.minute) // 1)
+        key = (st.year, st.month, st.day, st.hour * 60 + st.minute)
         if self._dl_surf is None or (key != self._dl_key and
                                      now - self._dl_t0 > 120):
             self._dl_t0 = now
@@ -1592,8 +1766,15 @@ class SolarSystemApp:
             surf.blit(val, (pad, y))
             y += 34
 
+    def _minute_bucket(self, t):
+        """Timezone-independent minute index for a naive-UTC datetime.
+
+        datetime.timestamp() interprets naive datetimes as *local* time, so
+        the bucket used to shift by the machine's UTC offset."""
+        return int((t - _UNIX_EPOCH).total_seconds()) // 60
+
     def _moon_phase(self):
-        key = int(self.sim_time.timestamp() // 60)
+        key = self._minute_bucket(self.sim_time)
         if key != self._moon_phase_key:
             self._moon_phase_key = key
             t = self.sim_time
@@ -1621,50 +1802,46 @@ class SolarSystemApp:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         if self.view_mode == "daylight":
-                            self.view_mode = "3d"
+                            self.toggle_view()
                         elif self.fullscreen:
                             self.toggle_fullscreen()
                         else:
                             running = False
                     elif event.key == pygame.K_SPACE:
-                        self.paused = not self.paused
+                        self.activate("play")
                     elif event.key in (pygame.K_UP, pygame.K_EQUALS,
                                        pygame.K_PLUS):
-                        self.speed_index = min(len(SPEED_DAYS) - 1,
-                                               self.speed_index + 1)
-                        self.realtime = False
+                        self.activate("faster")
                     elif event.key in (pygame.K_DOWN, pygame.K_MINUS):
-                        self.speed_index = max(0, self.speed_index - 1)
-                        self.realtime = False
+                        self.activate("slower")
                     elif event.key == pygame.K_t:
-                        self.realtime = not self.realtime
+                        self.activate("realtime")
                     elif event.key == pygame.K_d:
-                        self.show_extras = not self.show_extras
+                        self.activate("worlds")
                     elif event.key == pygame.K_l:
-                        self.show_labels = not self.show_labels
+                        self.activate("labels")
                     elif event.key == pygame.K_m:
-                        self.show_distance = not self.show_distance
-                        self.show_about = False
+                        self.activate("distance")
                     elif event.key == pygame.K_n:
-                        self.show_daynight = not self.show_daynight
+                        self.activate("daynight")
                     elif event.key == pygame.K_g:
-                        self.view_mode = "daylight" if self.view_mode == "3d" else "3d"
+                        self.activate("lightmap")
                     elif event.key == pygame.K_i:
-                        self.show_about = not self.show_about
-                        self.show_distance = False
+                        self.activate("about")
                     elif event.key == pygame.K_r:
-                        self.sim_time = self.start_time
+                        self.activate("today")
                     elif event.key == pygame.K_HOME:
-                        self.reset_view(True)
+                        self.activate("fit")
                     elif event.key == pygame.K_F11:
                         self.toggle_fullscreen()
                 elif event.type == pygame.MOUSEWHEEL:
                     mpos = pygame.mouse.get_pos()
-                    if mpos[1] < self.CANVAS_H and self.view_mode == "3d":
+                    if self.in_scene_view(mpos):
                         factor = 1.15 ** -event.y
                         self.cam.zoom_to(
                             mpos[0], mpos[1], factor, self.W, self.CANVAS_H,
                             move_target=(self.pinned is None))
+                        self._scene_dirty = True
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     self.drag_moved = False
                     if event.button == 1:
@@ -1674,13 +1851,12 @@ class SolarSystemApp:
                             self.held_btn = b["id"]
                             self.held_start = pygame.time.get_ticks()
                             self.held_last = self.held_start
-                        elif event.pos[1] < self.CANVAS_H and \
-                                self.view_mode == "3d":
+                        elif self.in_scene_view(event.pos):
                             self.dragging = True
                             self.drag_mode = "orbit"
                             self.drag_start = event.pos
-                    elif event.button in (2, 3) and event.pos[1] < self.CANVAS_H \
-                            and self.view_mode == "3d":
+                    elif event.button in (2, 3) and \
+                            self.in_scene_view(event.pos):
                         self.dragging = True
                         self.drag_mode = "pan"
                         self.drag_start = event.pos
@@ -1690,10 +1866,13 @@ class SolarSystemApp:
                             b = self.button_at(*event.pos)
                             if b is not None and b["id"] == self.pressed_btn:
                                 self.activate(self.pressed_btn)
-                        elif not self.drag_moved and event.pos[1] < self.CANVAS_H \
-                                and self.view_mode == "3d":
-                            picked = self.pick(*event.pos)
-                            self.pinned = None if picked == self.pinned else picked
+                        elif not self.drag_moved and \
+                                self.in_scene_view(event.pos):
+                            picked = self.pick(*event.pos, self._pick_bodies)
+                            new_pin = None if picked == self.pinned else picked
+                            if new_pin != self.pinned:
+                                self.pinned = new_pin
+                                self._scene_dirty = True
                         self.pressed_btn = None
                         self.held_btn = None
                         self.dragging = False
@@ -1712,6 +1891,8 @@ class SolarSystemApp:
                             self.cam.orbit(dx, dy)
                         elif self.drag_mode == "pan":
                             self.cam.pan(dx, dy, self.CANVAS_H)
+                        if self.drag_mode is not None:
+                            self._scene_dirty = True
                         self.drag_start = event.pos
 
             if self.held_btn in REPEAT_BTNS and pygame.mouse.get_pressed()[0]:
@@ -1732,17 +1913,9 @@ class SolarSystemApp:
                     self.sim_time += datetime.timedelta(
                         days=SPEED_DAYS[self.speed_index] * dt)
             if keys[pygame.K_LEFT]:
-                if self.realtime:
-                    self.sim_time -= datetime.timedelta(hours=dt * 3600)
-                else:
-                    self.sim_time -= datetime.timedelta(
-                        days=SPEED_DAYS[self.speed_index] * dt * 2)
+                self.scrub(-1, dt)
             if keys[pygame.K_RIGHT]:
-                if self.realtime:
-                    self.sim_time += datetime.timedelta(hours=dt * 3600)
-                else:
-                    self.sim_time += datetime.timedelta(
-                        days=SPEED_DAYS[self.speed_index] * dt * 2)
+                self.scrub(1, dt)
 
             self.update_world(dt)
 
@@ -1755,14 +1928,26 @@ class SolarSystemApp:
                 self.draw_daylight_map()
                 self.hovered = None
             else:
-                bodies = self.build_bodies()
-                data = render(self.ctx, self.scene, self.cam, bodies,
-                              sun_glow=SUN_GLOW)
-                surf = to_surface(data, self.scene.vw, self.scene.vh)
-                self.screen.blit(surf, (0, 0))
-                self._view = self.cam.view_matrix()
-                self._proj = self.cam.proj_matrix()
-                self.hovered = self.pick(*pygame.mouse.get_pos())
+                # Re-render the GL scene only when something can have changed;
+                # while paused and untouched, re-blit the cached frame.
+                if self._scene_dirty or not self.paused or \
+                        self._frame_surf is None:
+                    bodies = self.build_bodies()
+                    data = render(self.ctx, self.scene, self.cam, bodies,
+                                  sun_glow=SUN_GLOW)
+                    self._frame_surf = to_surface(data, self.scene.vw,
+                                                  self.scene.vh)
+                    self._pick_bodies = bodies
+                    self._view = self.cam.view_matrix()
+                    self._proj = self.cam.proj_matrix()
+                    self._scene_dirty = False
+                self.screen.blit(self._frame_surf, (0, 0))
+                mpos = pygame.mouse.get_pos()
+                if self.in_scene_view(mpos):
+                    self.hovered = self.pick(mpos[0], mpos[1],
+                                             self._pick_bodies)
+                else:
+                    self.hovered = None
                 self.draw_hud()
                 self.draw_selection_rings()
                 self.draw_labels()
@@ -1808,11 +1993,13 @@ def save_png(surface, path):
     w, h = surface.get_size()
     rgba = surface.get_bytesize() == 4
     px = pygame.image.tostring(surface, "RGBA" if rgba else "RGB", True)
-    raw = bytearray()
     bpp = 4 if rgba else 3
+    stride = w * bpp
+    parts = []
     for y in range(h):
-        raw.append(0)
-        raw += px[y * w * bpp:(y + 1) * w * bpp]
+        parts.append(b"\x00")
+        parts.append(px[y * stride:(y + 1) * stride])
+    raw = b"".join(parts)
     color_type = 6 if rgba else 2
 
     def chunk(tag, data):
@@ -1833,7 +2020,6 @@ def save_shot(path, w=1600, h=1000):
     """Headless single-frame render (for batch shots / CI checks)."""
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     pygame.init()
-    pygame.display.set_mode((w, h), pygame.RESIZABLE)
     app = SolarSystemApp()
     app.W, app.H = w, h
     app._rebuild_for_size(center=True)
@@ -1850,7 +2036,6 @@ def save_lightmap(path, w=1600, h=1000):
     """Headless daylight-map frame (for batch shots / CI checks)."""
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     pygame.init()
-    pygame.display.set_mode((w, h), pygame.RESIZABLE)
     app = SolarSystemApp()
     app.W, app.H = w, h
     app._rebuild_for_size(center=True)
@@ -1865,10 +2050,25 @@ def save_lightmap(path, w=1600, h=1000):
     return path
 
 
-if __name__ == "__main__":
-    if len(sys.argv) > 2 and sys.argv[1] == "--shot":
-        save_shot(sys.argv[2])
-    elif len(sys.argv) > 2 and sys.argv[1] == "--lightmap":
-        save_lightmap(sys.argv[2])
-    else:
+USAGE = ("usage: python solar_system.py\n"
+         "       python solar_system.py --shot OUTPUT.png\n"
+         "       python solar_system.py --lightmap OUTPUT.png")
+
+
+def main(argv):
+    if not argv:
         SolarSystemApp().run()
+    elif len(argv) == 2 and argv[0] == "--shot":
+        save_shot(argv[1])
+    elif len(argv) == 2 and argv[0] == "--lightmap":
+        save_lightmap(argv[1])
+    else:
+        try:
+            print(USAGE, file=sys.stderr)
+        except Exception:
+            pass
+        os._exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

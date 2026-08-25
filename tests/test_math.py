@@ -4,8 +4,6 @@ import datetime
 import math
 import unittest
 
-import numpy as np
-
 import solar_system as ss
 
 
@@ -20,12 +18,6 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(
             ss.lerp_color((0, 0, 0), (200, 100, 50), 1.0), (200, 100, 50))
         self.assertEqual(ss.lerp_color((0, 0, 0), (200, 100, 50), 0.5), (100, 50, 25))
-
-    def test_signpower(self):
-        self.assertEqual(ss.signpower(0.0, 0.65), 0.0)
-        self.assertAlmostEqual(ss.signpower(8.0, 3.0), 512.0)
-        self.assertAlmostEqual(ss.signpower(-8.0, 3.0), -512.0)
-        self.assertAlmostEqual(ss.signpower(-4.0, 0.5), -2.0)
 
 
 class TestTime(unittest.TestCase):

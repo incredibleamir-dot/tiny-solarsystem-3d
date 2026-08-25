@@ -14,7 +14,12 @@ planets and the Moon travel around the Sun — in three dimensions.
 
 ## Quick start
 
-Requires **Python 3.8+** and a GPU that supports **OpenGL 3.3**.
+The easiest way to run it is the ready-made Windows build: download
+**`TinySolarSystem3D.exe`** from the Releases page and double-click it -
+no Python required.
+
+To run from source you need **Python 3.8+** and a GPU that supports
+**OpenGL 3.3**.
 
 ```
 pip install -r requirements.txt
@@ -68,7 +73,9 @@ day and night regions at the current simulation time:
   **sunrise / sunset** lines;
 - **city lights** glowing on the night side;
 - the exact spot where the **Sun is directly overhead** (the sub-solar point)
-  marked with a yellow sun;
+  marked with a yellow sun - computed from the Sun's apparent right ascension
+  versus Greenwich sidereal time, so the **equation of time** is included and
+  high noon stays accurate to a fraction of a degree all year;
 - a 30° **latitude / longitude grid**, the date and time, and the longitude
   currently at high noon.
 
@@ -87,6 +94,7 @@ button again to return to the 3D view.
 | Click a world         | pin it — the camera follows it; click empty space to unpin |
 | `PLAY` / `Space`      | play / pause the sim clock                        |
 | `rewind` / `forward`  | jump one day back / forward                       |
+| `←` / `→` (hold)      | scrub time — realtime: 1 h/s, otherwise 2× current speed |
 | `slower` / `faster`   | change sim speed (6 hours/s ... 1 year/s)         |
 | `realtime` / `T`      | toggle **realtime** mode — 1 sim second = 1 real second |
 | `Today` / `R`         | jump back to real time                            |
@@ -113,6 +121,21 @@ grow like `semi-major-axis^0.65` and planet sizes like `sqrt(radius)`, while
 the *positions* are the real heliocentric ones from the `solarsystem` library.
 The world coordinates are shifted so the Sun sits at the origin.
 
+## The astronomy under the hood
+
+- **Positions** come from the vendored `solarsystem` library (Paul
+  Schlyter's low-precision planetary theory) every frame.
+- **Earth's 3D spin phase** is solved from the sub-solar geometry each
+  frame, so the day/night terminator and city lights on the 3D globe
+  line up exactly with the 2D daylight map.
+- **The 2D map's sub-solar point** uses the Sun's apparent right ascension
+  versus Greenwich mean sidereal time — the **equation of time** is included,
+  so high noon lands within a fraction of a degree of reality all year.
+- **The Moon** orbits with its real 5.1-degree inclination, and its orbit
+  ring is fitted in the Moon's true (slowly precessing) orbital plane.
+- **Earth's tilt axis** is fixed in inertial space, so the 3D globe shows
+  real seasons.
+
 Silently reproducible, so you can batch screenshots headlessly:
 
 ```
@@ -128,7 +151,9 @@ read-back 180° (sideways + upside) so the saved PNGs are upright — the
 
 A `unittest` suite lives in `tests/` — pure math/geometry checks plus a
 headless engine smoke test (it renders real frames off-screen and regression-
-tests the Saturn ring, snapshot orientation, orbit drag and wheel directions).
+tests the Saturn ring, snapshot orientation, orbit drag and wheel directions,
+the orbit-ring buffer, ephemeris caching, the sub-solar math and the Moon's
+inclined orbit).
 
 ```
 python -m unittest discover -s tests -v
@@ -146,6 +171,22 @@ context; on machines without a GPU they are skipped automatically.
 | `vendor/solarsystem/` | Paul Schlyter's planetary-position library (vendored) |
 | `textures/`     | the Solar System Scope maps + NASA LORRI Pluto |
 | `shots_3d/`     | example screenshots from the headless renderer |
+| `tests/`        | the unittest suite (run with `python -m unittest discover -s tests -v`) |
+| `TinySolarSystem3D.spec` | PyInstaller recipe for the single-file Windows build |
+
+## Building the Windows `.exe`
+
+The single-file release build is made with
+[PyInstaller](https://pyinstaller.org/):
+
+```
+pip install pyinstaller
+pyinstaller TinySolarSystem3D.spec
+```
+
+`dist/TinySolarSystem3D.exe` is fully self-contained (Python, pygame,
+NumPy, ModernGL and every texture inside one file) — attach it to a GitHub
+Release and it runs on any 64-bit Windows 10+ machine with OpenGL 3.3.
 
 ## Credits
 

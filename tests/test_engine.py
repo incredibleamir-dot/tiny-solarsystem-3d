@@ -19,7 +19,7 @@ import pygame
 import moderngl
 
 import solar_system as ss
-from scene3d import render, to_surface
+from scene3d import render, to_surface, ORBIT_SEGS, model_matrix
 
 
 def _make_app():
@@ -269,6 +269,261 @@ class TestApp(unittest.TestCase):
                 self.assertEqual(fh.read(8), b"\x89PNG\r\n\x1a\n")
             loaded = pygame.image.load(path)
             self.assertEqual(loaded.get_size(), (64, 48))
+
+    # ------------------------------------------------- regression: ring buffer
+    def test_no_ghost_rings_after_hiding_extras(self):
+        """Regression: shrinking the orbit-ring set must not leave the old
+        rings' geometry in the pre-allocated VBO (they used to keep
+        rendering because the VAO drew a fixed vertex count)."""
+        app = self.app
+        app.show_extras = False
+        app.update_world(0.0)
+        base = render(app.ctx, app.scene, app.cam, app.build_bodies(),
+                      sun_glow=ss.SUN_GLOW)
+        app.show_extras = True
+        app.update_world(0.0)
+        on = render(app.ctx, app.scene, app.cam, app.build_bodies(),
+                    sun_glow=ss.SUN_GLOW)
+        app.show_extras = False
+        app.update_world(0.0)
+        off = render(app.ctx, app.scene, app.cam, app.build_bodies(),
+                     sun_glow=ss.SUN_GLOW)
+        self.assertNotEqual(on, off, "extras toggle changed nothing")
+        self.assertEqual(off, base,
+                         "stale extra rings leaked into the extras-off frame")
+        self.assertEqual(app.scene.orbit_vert_count,
+                         len(ss.ALWAYS) * ORBIT_SEGS * 2)
+
+    # ------------------------------------------------------- perf: ephemeris
+    def test_update_world_caches_ephemeris(self):
+        app = self.app
+        calls = []
+        orig = ss.solarsystem.Heliocentric
+
+        def spy(*a, **k):
+            calls.append(1)
+            return orig(*a, **k)
+
+        ss.solarsystem.Heliocentric = spy
+        try:
+            app.sim_time += datetime.timedelta(hours=1)   # force a recompute
+            app.update_world(0.0)
+            n = len(calls)
+            app.update_world(0.0)                          # cached
+            self.assertEqual(len(calls), n)
+            app.sim_time += datetime.timedelta(minutes=1)  # clock moved
+            app.update_world(0.0)
+            self.assertEqual(len(calls), n + 1)
+        finally:
+            ss.solarsystem.Heliocentric = orig
+
+    def test_spins_freeze_while_paused(self):
+        app = self.app
+        app.paused = True
+        app.spin_angle["Earth"] = 10.0
+        try:
+            app.update_world(1.0 / 60.0)
+            self.assertEqual(app.spin_angle["Earth"], 10.0)
+            app.paused = False
+            app.update_world(1.0 / 60.0)
+            self.assertGreater(app.spin_angle["Earth"], 10.0)
+        finally:
+            app.paused = True
+
+    # ------------------------------------------------------------ scrub units
+    def test_scrub_realtime_is_one_hour_per_second(self):
+        app = self.app
+        t0 = app.sim_time
+        old_rt, old_idx = app.realtime, app.speed_index
+        try:
+            app.realtime = True
+            app.scrub(1, 1.0)
+            self.assertEqual(app.sim_time - t0, datetime.timedelta(hours=1))
+            app.scrub(-1, 0.5)
+            self.assertEqual(app.sim_time - t0, datetime.timedelta(minutes=30))
+        finally:
+            app.sim_time = t0
+            app.realtime = old_rt
+            app.speed_index = old_idx
+
+    def test_scrub_preset_runs_double_speed(self):
+        app = self.app
+        t0 = app.sim_time
+        old_rt, old_idx = app.realtime, app.speed_index
+        try:
+            app.realtime = False
+            app.speed_index = 2   # "1 day per second"
+            app.scrub(1, 1.0)
+            self.assertEqual(app.sim_time - t0, datetime.timedelta(days=2))
+        finally:
+            app.sim_time = t0
+            app.realtime = old_rt
+            app.speed_index = old_idx
+
+    # ------------------------------------------------------- input hit region
+    def test_in_scene_view_excludes_panel_and_taskbar(self):
+        app = self.app
+        app.view_mode = "3d"
+        try:
+            self.assertTrue(app.in_scene_view((10, 10)))
+            self.assertFalse(app.in_scene_view((app.W - 10, 10)),
+                             "panel area must not pick worlds")
+            self.assertFalse(app.in_scene_view((app.VIEW_W + 5, 10)))
+            self.assertFalse(app.in_scene_view((10, app.CANVAS_H + 2)),
+                             "taskbar must not pick worlds")
+            self.assertFalse(app.in_scene_view((-1, 10)))
+            app.view_mode = "daylight"
+            self.assertFalse(app.in_scene_view((10, 10)))
+        finally:
+            app.view_mode = "3d"
+
+    # ---------------------------------------------------------------- today
+    def test_today_button_uses_wall_clock(self):
+        app = self.app
+        t0 = app.sim_time
+        try:
+            app.sim_time = datetime.datetime(2000, 6, 1)
+            app.activate("today")
+            delta = abs((app.sim_time - ss.utc_now()).total_seconds())
+            self.assertLess(delta, 5.0)
+        finally:
+            app.sim_time = t0
+
+    def test_minute_bucket_is_timezone_independent(self):
+        app = self.app
+        t = datetime.datetime(2024, 5, 5, 12, 0, 30)
+        expected = int((t - ss._UNIX_EPOCH).total_seconds()) // 60
+        self.assertEqual(app._minute_bucket(t), expected)
+
+    # ----------------------------------------------- science: sub-solar point
+    def test_subsolar_includes_equation_of_time(self):
+        # In early November the equation of time peaks near +16.4 min, so at
+        # 12:00 UTC the sub-solar point sits ~4 degrees WEST of Greenwich
+        # instead of on the meridian.
+        app = self.app
+        t0 = app.sim_time
+        try:
+            app.sim_time = datetime.datetime(2026, 11, 3, 12, 0)
+            lon, _ = app._dl_subsolar()
+            self.assertGreater(math.degrees(lon), -5.5)
+            self.assertLess(math.degrees(lon), -2.5)
+        finally:
+            app.sim_time = t0
+
+    def test_subsolar_declination_tracks_seasons(self):
+        app = self.app
+        t0 = app.sim_time
+        try:
+            cases = [
+                (datetime.datetime(2026, 6, 21, 12, 0), +23.44),
+                (datetime.datetime(2026, 12, 21, 12, 0), -23.44),
+                (datetime.datetime(2026, 3, 20, 15, 0), 0.0),
+            ]
+            for when, want in cases:
+                app.sim_time = when
+                _, decl = app._dl_subsolar()
+                self.assertAlmostEqual(math.degrees(decl), want, delta=0.35,
+                                       msg=str(when))
+        finally:
+            app.sim_time = t0
+
+    # ------------------------------------------------ science: Earth spin phase
+    def test_earth_spin_sweeps_daily(self):
+        # Advancing 6 hours must turn the mesh ~90 degrees relative to the
+        # Sun; a tidal-locked phase would leave it fixed.
+        app = self.app
+        t0 = app.sim_time
+        try:
+            app.sim_time = datetime.datetime(2026, 8, 1, 0, 0)
+            app.update_world(0.0)
+            r0 = app.earth_rot
+            app.sim_time += datetime.timedelta(hours=6)
+            app.update_world(0.0)
+            dr = math.degrees((app.earth_rot - r0) % math.tau)
+            dr = min(dr, 360.0 - dr)
+            self.assertAlmostEqual(dr, 90.0, delta=2.0)
+        finally:
+            app.sim_time = t0
+            app.update_world(0.0)
+
+    def test_earth_lighting_matches_daynight_map(self):
+        # Spherical-trig cross-check: the shader lights a surface point by
+        # cos(solar zenith angle).  For the texture's Greenwich equator point
+        # that value follows from the sub-solar latitude/longitude of the 2D
+        # map; the rendered mesh orientation must reproduce it.
+        app = self.app
+        app.update_world(0.0)
+        earth = next(b for b in app.build_bodies() if b["name"] == "Earth")
+        g = np.array([-1.0, 0.0, 0.0], dtype=np.float32)   # u=.5, equator
+        m = model_matrix(earth["pos"], 1.0, rot_y=earth["rot"],
+                         tilt=earth["tilt"])
+        w = m[:3, :3] @ g
+        w = w / np.linalg.norm(w)
+        sh = -np.asarray(earth["pos"], dtype=np.float64)
+        sh /= np.linalg.norm(sh)
+        got = float(np.dot(w, sh))
+        lon_s, decl = app._dl_subsolar()
+        want = math.cos(decl) * math.cos(lon_s)            # lat 0, lon 0
+        self.assertAlmostEqual(got, want, delta=1e-3)
+
+    def test_earth_axis_gives_real_seasons(self):
+        # The tilt axis is fixed in inertial space, so the pole-to-Sun dot
+        # product must peak near the June solstice and bottom out near the
+        # December one.
+        app = self.app
+        t0 = app.sim_time
+        vals = {}
+        try:
+            for label, when in (
+                    ("jun", datetime.datetime(2026, 6, 21, 12, 0)),
+                    ("dec", datetime.datetime(2026, 12, 21, 12, 0))):
+                app.sim_time = when
+                app.update_world(0.0)
+                ew = app.world["Earth"].astype(np.float64)
+                sh = -ew / np.linalg.norm(ew)
+                eps = ss.TILTS["Earth"]
+                pole = np.array([0.0, math.cos(eps), math.sin(eps)])
+                vals[label] = float(np.dot(pole, sh))
+            self.assertGreater(vals["jun"], 0.30)
+            self.assertLess(vals["dec"], -0.30)
+        finally:
+            app.sim_time = t0
+            app.update_world(0.0)
+
+    # --------------------------------------------------- science: Moon incline
+    def test_moon_orbit_ring_is_inclined(self):
+        app = self.app
+        app.sim_time += datetime.timedelta(days=3)
+        app.update_world(0.0)
+        raw = app.scene.moon_ring_buf.read()
+        pts = np.frombuffer(raw, dtype=np.float32).reshape(-1, 6)
+        ys = pts[:, 1].astype(np.float64)
+        amp = (ys.max() - ys.min()) / 2.0
+        # 5.14-deg inclination at the stylised ORB_MOON radius -> ~0.23.
+        self.assertGreater(amp, 0.15, "Moon ring looks flat")
+        self.assertLess(amp, 0.31, "Moon ring inclination out of range")
+
+    def test_moon_position_uses_ecliptic_latitude(self):
+        app = self.app
+        t0 = app.sim_time
+        try:
+            app.sim_time += datetime.timedelta(days=7)
+            app.update_world(0.0)
+            t = app.sim_time
+            m = ss.solarsystem.Moon(
+                year=t.year, month=t.month, day=t.day,
+                hour=t.hour, minute=t.minute, UT=0, dst=0,
+                longtitude=0.0, latitude=0.0, topographic=False)
+            lo, la, _ = m.position()
+            lo, la = math.radians(lo), math.radians(la)
+            rel = app.world["Moon"] - app.world["Earth"]
+            expect = ss.ORB_MOON * np.array(
+                [math.cos(lo) * math.cos(la), math.sin(la),
+                 math.sin(lo) * math.cos(la)], dtype=np.float32)
+            self.assertTrue(np.allclose(rel, expect, atol=1e-3))
+        finally:
+            app.sim_time = t0
+            app.update_world(0.0)
 
 
 class TestMathAgain(unittest.TestCase):

@@ -12,7 +12,6 @@ The scene is stylised (not to true scale) so every world stays visible.
 """
 
 import math
-import os
 
 import numpy as np
 import moderngl
@@ -20,9 +19,11 @@ import moderngl
 FOVY = 45.0
 NEAR, FAR = 0.1, 1200.0
 
-TILT_EARTH = math.radians(23.44)
-
 STARFIELD = 900
+
+ORBIT_RINGS_MAX = 12   # ring-buffer capacity (ALWAYS + EXTRAS bodies)
+ORBIT_SEGS = 128       # polyline segments per orbit ring
+MOON_SEGS = 96         # polyline segments in the Moon's orbit ring
 
 # ---------------------------------------------------------------------------
 # Shaders
@@ -473,12 +474,10 @@ class Scene:
             self.prog_ring, [(ctx.buffer(rq), "3f 2f",
                               "in_position", "in_uv")], ctx.buffer(rqi))
 
-                # Buffers are pre-allocated at their full size so the VAOs keep the
-        # right vertex count (moderngl caches it at creation; orphaning a
-        # buffer afterwards does not update it).
-        ORBIT_RINGS_MAX = 12
-        ORBIT_SEGS = 128
-        MOON_SEGS = 96
+        # Ring buffers are pre-allocated at their full capacity so the VAOs
+        # keep the right vertex count (moderngl caches it at creation).
+        # Only the leading orbit_vert_count vertices are ever drawn, so a
+        # smaller ring set can never leak stale geometry into the frame.
         orbit_zeros = np.zeros(
             ORBIT_RINGS_MAX * ORBIT_SEGS * 2 * 6, dtype=np.float32)
         moon_zeros = np.zeros(MOON_SEGS * 2 * 6, dtype=np.float32)
@@ -486,6 +485,7 @@ class Scene:
         self.orbit_vao = ctx.vertex_array(
             self.prog_line, [(self.orbit_buf, "3f 3f",
                               "in_position", "in_color")])
+        self.orbit_vert_count = 0
 
         self.moon_ring_buf = ctx.buffer(moon_zeros.tobytes())
         self.moon_ring_vao = ctx.vertex_array(
@@ -524,28 +524,47 @@ class Scene:
             data, comp = surface_to_gl(surf)
             tw, th = surf.get_size()
             tex = self.ctx.texture((tw, th), comp, data)
-            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            tex.build_mipmaps()
+            tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+            try:
+                max_aniso = self.ctx.info.get(
+                    "GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT")
+                if max_aniso:
+                    tex.anisotropy = min(8.0, float(max_aniso))
+            except Exception:
+                pass
             self.textures[name] = tex
 
     def set_orbit_rings(self, rings):
-        """rings: list of (radius, rgb-tuple)."""
-        if not rings:
-            self.orbit_buf.write(self.orbit_buf.read(0, self.orbit_buf.size))
-            return
-        data = circle_line_arrays(
-            [(r, c[0] / 255.0, c[1] / 255.0, c[2] / 255.0) for r, c in rings])
-        self.orbit_buf.write(data.tobytes())
+        """rings: list of (radius, rgb-tuple).
 
-    def set_moon_ring(self, center, radius, color):
+        Writes the rings at the front of the pre-allocated buffer and records
+        how many vertices belong to them; render() only draws that prefix,
+        so leftover data from a previous, larger ring set is never drawn."""
+        if rings:
+            data = circle_line_arrays(
+                [(r, c[0] / 255.0, c[1] / 255.0, c[2] / 255.0)
+                 for r, c in rings])
+            self.orbit_buf.write(data.tobytes())
+        self.orbit_vert_count = len(rings) * ORBIT_SEGS * 2
+
+    def set_moon_ring(self, center, offsets, color):
+        """Draw the Moon's orbit ring as a closed polyline through Earth.
+
+        offsets: MOON_SEGS unit direction vectors (scene frame) describing
+        the true (inclined) orbital plane; each is scaled by the app to the
+        stylised orbit radius before reaching this point."""
         r, g, b = color[0] / 255.0, color[1] / 255.0, color[2] / 255.0
+        n = min(len(offsets), MOON_SEGS)
         pts = []
-        for i in range(96):
-            a0 = math.radians(360.0 * i / 96)
-            a1 = math.radians(360.0 * (i + 1) / 96)
-            for a in (a0, a1):
-                c, s = math.cos(a), math.sin(a)
-                pts.append((center[0] + c * radius, 0.0,
-                            center[2] + s * radius, r, g, b))
+        for i in range(n):
+            a = np.asarray(offsets[i], dtype=np.float32)
+            b2 = np.asarray(offsets[(i + 1) % n], dtype=np.float32)
+            for off in (a, b2):
+                pts.append((center[0] + off[0], center[1] + off[1],
+                            center[2] + off[2], r, g, b))
+        while len(pts) < MOON_SEGS * 2:
+            pts.append((center[0], center[1], center[2], 0.0, 0.0, 0.0))
         data = np.array(pts, dtype=np.float32).ravel()
         self.moon_ring_buf.write(data.tobytes())
 
@@ -631,14 +650,13 @@ def render(ctx, scene, cam, bodies, sun_glow=6.5,
             scene.textures["SaturnRing"].use(0)
             scene.ring_vao.render(moderngl.TRIANGLES)
 
-    ctx.line_width = 1.0
     line = scene.prog_line
     set_mat(line, "u_view", view)
     set_mat(line, "u_proj", proj)
     ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
-    scene.orbit_vao.render(moderngl.LINES)
+    scene.orbit_vao.render(moderngl.LINES,
+                           vertices=scene.orbit_vert_count)
     scene.moon_ring_vao.render(moderngl.LINES)
-    ctx.line_width = 1.0
     ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
     ctx.depth_mask = False
@@ -667,7 +685,3 @@ def to_surface(data, w, h):
     import pygame
     surf = pygame.image.frombuffer(data, (w, h), "RGB").convert()
     return pygame.transform.flip(surf, False, True).convert()
-
-
-def main_path():
-    return os.path.dirname(os.path.abspath(__file__))
