@@ -185,8 +185,7 @@ pyinstaller TinySolarSystem3D.spec
 ```
 
 `dist/TinySolarSystem3D.exe` is fully self-contained (Python, pygame,
-NumPy, ModernGL and every texture inside one file) — attach it to a GitHub
-Release and it runs on any 64-bit Windows 10+ machine with OpenGL 3.3.
+NumPy, ModernGL and every texture inside one file)
 
 ## Credits
 
